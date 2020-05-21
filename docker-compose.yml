@@ -1,0 +1,12 @@
+version: "3.0"
+services:
+ graphs:
+  image: rocker/tidyverse
+  environment:
+   - DISABLE_AUTH=True
+   - ROOT=True
+  ports:
+
+   - "8787:8787"
+  volumes:
+   - ./:/home/rstudio

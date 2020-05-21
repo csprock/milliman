@@ -1,0 +1,302 @@
+---
+title: "Collinearity and Trending"
+output: html_notebook
+author: Carson Sprock
+---
+
+```{r include=FALSE, message=FALSE}
+
+
+library(forecast)
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(reshape2)
+library(car)
+library(pracma)
+
+
+combined_data <- read_csv("~/data/combined_data.csv") %>%
+  dplyr::select(-Period) %>%
+  rename(quarter=Period_d) %>%
+  filter(Geography != "District Of Columbia") %>%
+  mutate(
+    Geography=as.factor(Geography)
+  )
+
+combined_data <- combined_data %>%
+  group_by(Geography) %>%
+  mutate(
+    refi_orig_ma = pracma::movavg(refi_orig, 3, "e"),
+    purch_orig_ma = pracma::movavg(purch_orig, 3, "e"),
+    trend = seq(1, n())
+  ) %>% ungroup()
+
+```
+
+
+```{r}
+
+cols_to_ignore <- c("quarter", "trend", "purch_orig", "refi_orig", "Geography")
+cols_to_use <- setdiff(colnames(combined_data), cols_to_ignore)
+
+
+extract_model_stats <- function(lm_fit){
+  # extract the R-squared and mean squared error from an lm object
+  
+  fit_summary <- summary(lm_fit)
+  fit_anova <- anova(lm_fit)
+  
+  output <- c(fit_summary$r.squared, tail(fit_anova$`Mean Sq`, 1))
+  
+  return(output)
+}
+
+quantify_trend <- function(x, y){
+  lm_fit <- lm(y ~ x)
+  return(extract_model_stats(lm_fit))
+}
+
+results_df <- vector()
+for (state in unique(combined_data$Geography)){
+  
+  for (col in cols_to_check){
+    
+    y <- combined_data %>%
+      filter(Geography==eval(state)) %>%
+      pull(col)
+    x <- combined_data %>%
+      filter(Geography==eval(state)) %>%
+      pull("trend")
+    
+    results <- c(state, col, quantify_trend(x, y))
+    results_df <- c(results_df, results)
+    
+  }
+}
+
+
+
+results_df <- matrix(results_df, ncol=4, byrow=TRUE)
+colnames(results_df) <- c("state", "variable", "rsquared", "mse")
+
+results_df <- as_tibble(results_df) %>%
+  mutate(
+    rsquared=round(as.double(rsquared),2),
+    mse=as.double(mse),
+    state=as.factor(state)
+  )
+
+
+results_df %>%
+  rename(`R Squared`=rsquared) %>%
+  ggplot(
+    mapping=aes(
+      x=state,
+      y=variable
+    )
+  ) + 
+  geom_tile(mapping=aes(fill=`R Squared`), color="white") + 
+  geom_text(aes(label=`R Squared`)) + 
+  scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("State") + ylab("Variable") + ggtitle("Trend R-Squared Values") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+```
+
+```{r}
+
+cols_to_ignore <- c("quarter", "purch_orig", "refi_orig", "Geography", "HPI")
+cols_to_use <- setdiff(colnames(combined_data), cols_to_ignore)
+
+f <- as.formula(paste0("HPI ~", paste(cols_to_use, collapse="+")))
+
+results <- tibble()
+for (state in unique(combined_data$Geography)){
+  
+  data_subset <- combined_data %>%
+    filter(Geography==eval(state))
+  
+  base_model <- lm(f, data=data_subset)
+  vifs <- round(car::vif(base_model))
+  vars <- names(vifs)
+  
+  temp <- tibble(state, vars, vifs)
+  results <- bind_rows(results, temp)
+}
+
+
+results %>%
+  rename(
+    VIF=vifs,
+  ) %>%
+  ggplot(
+    mapping=aes(
+      x=state,
+      y=vars
+    )
+  ) + 
+  geom_tile(mapping=aes(fill=VIF), color="white") + 
+  geom_text(aes(label=VIF)) + 
+  scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("State") + ylab("VIF") + ggtitle("Variance Inflation Factors") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+
+```
+
+
+
+```{r include=FALSE}
+variance_proportion_table <- function(x){
+  
+  svd_decomp <- svd(x)
+  
+  mu <- svd_decomp$d                # singular values
+  condition_index <- max(mu) / mu   # condition index
+  
+  # create variance proportion matrix
+  Mu <- matrix(rep(mu, length(mu)), byrow=TRUE, nrow=length(mu))
+  phi <- (svd_decomp$v^2 / Mu^2)
+  phi_sum <- apply(phi, 1, sum)
+  phi_sum <- matrix(rep(phi_sum, length(phi_sum)), byrow=FALSE, nrow=length(phi_sum))
+  variance_proportion <- phi / phi_sum
+  
+  if (!is.null(colnames(x))){
+    row.names(variance_proportion) <- colnames(x)
+  }
+  
+  colnames(variance_proportion) <- as.character(round(condition_index,4))
+  
+  output <- list(
+    condition_index=condition_index,
+    variance_proportions=variance_proportion
+  )
+  
+  return(output)
+}
+
+```
+
+
+
+
+```{r echo=FALSE}
+cols_to_ignore <- c("quarter", "purch_orig", "refi_orig", "Geography", "HPI")
+cols_to_use <- setdiff(colnames(combined_data), cols_to_ignore)
+
+
+X_scaled <- combined_data %>% 
+ filter(Geography=="California") %>%
+ dplyr::select(cols_to_use) %>%
+ mutate_all(function(x) {x / sqrt(sum(x^2))}) %>%
+ as.matrix()
+
+X_scaled <- cbind(rep(1, nrow(X_scaled)), X_scaled) 
+
+
+variance_decomp <- variance_proportion_table(X_scaled)
+
+variance_proportion <- variance_decomp$variance_proportions[-1,] %>% 
+  t() %>%
+  as_tibble() %>% 
+  round(2)
+
+condition_index <- tibble::enframe(
+  round(variance_decomp$condition_index,2), 
+  name=NULL, 
+  value="condition_index")
+
+combined <- dplyr::bind_cols(condition_index, variance_proportion) %>%
+  dplyr::select(-c(trend))
+
+reshape2::melt(combined, id.vars="condition_index") %>%
+  rename(Proportion=value) %>%
+ggplot(mapping=aes(x=as.factor(condition_index), y=variable)) + 
+geom_tile(
+  mapping=aes(
+    fill=Proportion
+  ),
+  color="white"
+) + geom_text(aes(label=Proportion)) + 
+    scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("Condition Index") + ylab("Indicator") + ggtitle("Variance Proportion Table") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+```
+
+
+
+
+
+
+# Appendix
+
+## Variance Inflation Factors
+
+The variance inflation factor of the $k$th coefficient of a linear regression model is defined as 
+$$
+VIF_k = \frac{1}{1-R_k^2}
+$$
+where $R_k^2$ is the R-squared value from regressing $x_k$ on all the remaining variables. $R_k^2$ is the fraction of the variation in $x_k$ explained by the other variables. A high $VIF_k$ indicates that $R_k^2$ is near 1 and is an overall indication that $x_k$ is collinear with some of the other variables [2].
+
+## Variance-Decomposition Method
+
+The variance-decomposition method relies on the fact that matrices that are near-singular (and have near-linear relationships among the columns) tend to have "small" singular values and that the variance of the regression coefficients can be decomposed into a sum of terms involving these values. 
+
+
+Specifically, the condition number of a matrix $\mathbf{X}$ is defined as the ratio between the smallest and largest singular values:
+
+$$
+\kappa(\mathbf{X}) = \frac{\mu_{max}}{\mu_{min}}
+$$
+A large condition number indicates the matrix is near-singluar. [1] extend this concept to define a *condition index* which is the ratio of each singular value with the the largest:
+
+$$
+\nu_k = \frac{\mu_{max}}{\mu_k}
+$$
+
+The presense of large condition indices can help us identify collinearity in conjuction with the decomposition, which we detail next. 
+
+The covariance of the regression $\mathbf{y} = \mathbf{X}\mathbf{\beta} + \mathbf{e}$ is $\sigma^2 (\mathbf{X}^T\mathbf{X})^{-1}$ whose diagonal elements are the variances of the regression coefficients, $\beta_k$. Using the singular value decomposition of $\mathbf{X}=\mathbf{U}\mathbf{D}\mathbf{V}^T$, the variance can be expressed as 
+
+$$
+\sigma^2 (\mathbf{X}^T\mathbf{X})^{-1} = \sigma^2VD^{-2}V^T
+$$
+
+where the $k$th diagonal entry is
+$$
+var(\beta_k) = \sigma^2 \sum_{j} \frac{v_{kj}^2}{\mu_j^2}
+$$
+which shows that the variance can be decomposed into a sum involving the singular values of $\mathbf{X}$. ($\mathbf{X}$ must be scaled so the columns have unit length before applying SVD). Very small singular values will increase the ratio term and contribute more to the variance, all else being equal. 
+
+Next they define the *variance-decomposition proportion* by simply converting the terms in the sum into proportions that sum to 1. The result is a table whose entries $\pi_{kj}$ is the proportion of $var(\beta_k)$ associated with the $j$th term in the decomposition sum (involving the $j$th singular value). The entries of this table can be used in conjunction with the condition indices to identify collinear relationships. 
+
+The diagnostic procedure has two parts: 
+
+1. a singular value with a high condition index which is associated with
+2. high variance-decomposition proportions for *two or more* variables
+
+The proceedure involves choosing cut-offs for both the proportion and the condition index. Empirical experiments in [1] showed that strong collinearity began to manifest as condition indices went over 30. They also use 50% as their cutoff for the variance proportions. The number of condition indices above the cutoff is taken as the number of near-dependencies in the columns of $X$. 
+
+There are three cases for determining the kind of dependency a variable is involved in:
+
+* a single linear dependency: a variable has a high variance-decomposition proportion associated with a high condition index along with at least one other variable
+* competing dependencies: when there are multiple high condition indices of similar magnitude, it is possible to tell by summing the variance-proprtions across the variables which variables are involved in the dependencies, but not which dependencies they are involved in
+* dominating dependencies: if there are two high condition indices such that $\mu_1 << \mu_2$, and a variable has a high variance-decomposition proportion associated with $\mu_2$, we cannot rule out its involvement with the variables associated with $\mu_1$ because the dependency identified in $\mu_2$ is so strong that it masks the weaker one 
+
+
+# References
+
+[1] Belsley, David A., Edwin Kuh, and Roy E. Welsch. *Regression diagnostics: Identifying influential data and sources of collinearity*. Vol. 571. John Wiley & Sons, 2005.
+
+
+[2] Wooldridge, Jeffrey M. *Introductory econometrics: A modern approach*. Thomson, South-Western, 2003
+
+
+
+
+
+
