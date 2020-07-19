@@ -2,14 +2,17 @@ library(tidyverse)
 library(glue)
 library(stringr)
 
+# load data
 econ_data <- readr::read_csv("~/data/economic_data.csv") %>%
   dplyr::select(-X1)
 housing_data <- readr::read_csv("~/data/housing_data.csv") %>%
   dplyr::select(-X1)
-supp_data <- readr::read_csv("~/data/supplement_data_t.csv")
+supp_data <- readr::read_csv("~/data/supplement_data_t.csv")  # this data has been tranposed in Excel first
 
 
-combined_data <- inner_join(
+# join data by geography and period
+# convert period quarters from strings to lubridate date objects
+combined_data_quarter <- inner_join(
   econ_data,
   housing_data,
   on=c("Geography","Period")
@@ -19,9 +22,10 @@ combined_data <- inner_join(
 ) %>%
   mutate(
     Period=str_replace(Period, "Q","."),
-    Period_d=lubridate::yq(Period)
-  )
+    quarter=lubridate::yq(Period),
+    year=lubridate::year(quarter)
+  ) %>%
+  dplyr::select(-c("Period")) # remove "Period" column
 
 
-write_csv(combined_data, "~/data/combined_data.csv")
-
+write_csv(combined_data_quarter, "~/data/combined_data_quarter.csv")
