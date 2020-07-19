@@ -1,0 +1,1323 @@
+---
+title: "Milliman Technical Assessment"
+output: html_notebook
+author: Carson Sprock
+date: 5/26/2020
+---
+
+```{r load_data_and_packages, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(pracma)
+library(corrplot)
+library(urca)
+library(glue)
+library(tsutils)
+library(dynlm)
+library(dynamac)
+
+combined_data_quarter <- read_csv("~/data/combined_data_quarter.csv") %>%
+  filter(Geography != "District Of Columbia") %>%
+  mutate(
+    Geography=as.factor(Geography)
+  ) %>% drop_na() # remove NAs (corresponding to the hold-out set)
+
+econ_vars <- c("GDP", "labor_part", "PCI")
+pop_vars <- c("migration_qtr", "total_pop")
+housing_vars <- c("HPI", "purch_orig", "refi_orig", "hsng_affrdblty")
+
+```
+
+
+# Preliminaries
+
+## Outlier Removal
+
+First we look for outliers in the original time series. Previous visual inspection showed the presense of some outliers. An automatic outlier [detection method](https://robjhyndman.com/hyndsight/forecast5/) was attempted, however it resulted in too many false positives. We also tried flagging outliers by looking at the percent change between two observations in time and flagging it as an outlier if the percentage change exceeded a threshold. This method also resulted in too many false positives. However, since the number data series was small and many of the outliers obvious enough that we can do this manually. 
+
+
+```{r automatic_imputation}
+
+cols_to_check <- c(econ_vars, pop_vars, housing_vars)
+
+percent_change <- function(x){
+  return((x - lag(x))/lag(x))
+}
+
+# return the index of all points x[i] s.t. (x[i] - x[i-1])/x[i] exceeded a threshold
+pct_change_outliers <- function(x, thresh=1){
+  
+  outliers <- abs(percent_change(x)) > thresh
+  
+  if (sum(outliers, na.rm=TRUE) > 0){
+    return(which(outliers)-1)
+  } else{
+    return(NULL)
+  }
+}
+
+
+# none of the outliers were on the boundary of the time series or spanned more than two periods
+# so we can take the mean of the series before and after
+impute_mean <- function(x, i){
+  return(mean(x[i-1], x[i+1]))
+}
+
+
+#outlier_method <- "hyndman"
+#outlier_method <- "percent_change"
+outlier_method <- "manual"
+
+# loop over the states in the data sets and apply the selected
+# outlier removal method
+for (state in unique(combined_data_quarter$Geography)){
+  
+  # get the index of the row in the data frame where the current state's data begins
+  offset <- which(
+    combined_data_quarter$Geography == eval(state) & 
+    combined_data_quarter$quarter == min(combined_data_quarter$quarter)
+  )
+  
+  # now loop over the selected columns and detect and impute the outliers
+  for (col in cols_to_check){
+    
+    # get the index of the column 
+    col_idx <- which(colnames(combined_data_quarter) == eval(col))
+    
+    # extract the vector from the data frame
+    values <- combined_data_quarter %>% 
+        filter(Geography==eval(state)) %>%
+        pull(eval(col))
+    
+    
+    # apply selected outlier method
+    if (outlier_method == "hyndman"){
+      # use outlier method from # https://robjhyndman.com/hyndsight/forecast5/
+      outliers <- forecast::tsoutliers(values)
+      
+      if (length(outliers$index) > 0){
+        combined_data_quarter[outliers$index + offset - 1, col_idx] <- outliers$replacement
+      }
+      
+    } else if (outlier_method=="percent_change"){
+      
+      outliers <- pct_change_outliers(values, thresh=1)
+      
+      if (!is.null(outliers)){
+        # impute each outlier with the mean of the time-adjacent points
+        for (i in outliers){
+          combined_data_quarter[i + offset - 1, col_idx] <- impute_mean(values, i)
+        }
+      }
+      
+    } 
+  }
+}
+
+```
+
+```{r manual_imputation}
+# impute mean for outliers/bad data manually
+
+## Impute hsng_affrdblty
+combined_data_quarter$hsng_affrdblty[which(combined_data_quarter$hsng_affrdblty < 10)] <- NA
+
+for (state in unique(combined_data_quarter$Geography)){
+  
+  # get the indices for the each state 
+  idx <- with(combined_data_quarter, which(Geography==eval(state) & is.na(hsng_affrdblty)))
+  
+  if (length(idx) > 0){
+    for (i in idx){
+      combined_data_quarter$hsng_affrdblty[i] <- impute_mean(combined_data_quarter$hsng_affrdblty, i)
+    }
+  }
+}
+
+## Impute migration_qtr
+
+idx <- with(combined_data_quarter, which(Geography=="Alabama" & migration_qtr > 15))
+combined_data_quarter$migration_qtr[idx] <- impute_mean(combined_data_quarter$migration_qtr, idx)
+```
+
+
+The following three cells/graphs are for visually checking the outliers have been removed. Select a state and run the cell. 
+
+```{r}
+# Select state
+STATE <- "Alaska"
+```
+
+
+```{r, echo=FALSE}
+
+combined_data_quarter %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, econ_vars)) %>%
+  ts(start=c(1990,1), end=c(2018,2), frequency=4) %>%
+  autoplot(facet=TRUE) + ggtitle("Economic Variables", subtitle=eval(STATE))
+
+
+combined_data_quarter %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, housing_vars)) %>%
+  ts(start=c(1990,1), end=c(2018,2), frequency=4) %>%
+  autoplot(facet=TRUE) + ggtitle("Housing Variables", subtitle=eval(STATE))
+
+combined_data_quarter %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, pop_vars)) %>%
+  ts(start=c(1990,1), end=c(2018,2), frequency=4) %>%
+  autoplot(facet=TRUE) + ggtitle("Population Variables", subtitle=eval(STATE))
+
+```
+
+
+## Transformations and Derived Variables
+
+While looking for outliers, it was noticed that there was significant variation in the purchase and refinance origination variables. To smooth out this variation, we replace them with a one year exponential moving average. The results for California purchase originations is shown below in red. 
+
+```{r moving_average}
+combined_data_quarter <- combined_data_quarter %>% group_by(Geography) %>%
+  mutate(
+    refi_orig_ma = pracma::movavg(refi_orig, 4, "e"),
+    purch_orig_ma = pracma::movavg(purch_orig, 4, "e"),
+  ) %>% ungroup()
+
+```
+
+
+```{r view_moving_average, echo=FALSE}
+STATE <- "California"
+combined_data_quarter %>%
+  filter(Geography==eval(STATE)) %>%
+  ggplot() + 
+  geom_line(
+    mapping=aes(
+      x=quarter,
+      y=purch_orig
+    )
+  ) + 
+  geom_line(
+    mapping=aes(
+      x=quarter,
+      y=purch_orig_ma
+    ),
+    color="red"
+  ) + ggtitle("California Purchace Originations", subtitle="Original vs Moving Average") + 
+  xlab("Quarter") +
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+Next we aggregate the quarterly data by year. The following variables summed over the quarters in the corresponding year: *purch_orig*, *refi_orig*, *migration_qtr*. The remaining variables are averaged. 
+
+```{r annual_aggregates }
+# aggregate quarterly data to annual data
+## variables summed: purch_orig, refi_orig, migration_qtr
+## variables averaged: GDP, labor_part, hsng_affrdblty, total_pop
+combined_data_annual <- combined_data_quarter %>%
+  group_by(Geography, year) %>%
+  summarise(
+    GDP=mean(GDP),
+    labor_part=mean(labor_part),
+    PCI=mean(PCI),
+    HPI=mean(HPI),
+    purch_orig=sum(purch_orig),
+    refi_orig=sum(refi_orig),
+    hsng_affrdblty=mean(hsng_affrdblty),
+    migration_qtr=sum(migration_qtr),
+    total_pop=mean(total_pop)
+  ) %>% ungroup() 
+
+write_csv(combined_data_annual, "~/data/combined_data_annual.csv")
+
+```
+
+
+
+```{r switch}
+# Choose the data set to be used for the remainder of the analysis and modeling
+FREQUENCY <- "annual"
+
+if (FREQUENCY == "annual"){
+  data <- combined_data_annual %>% filter(year != 2018) %>% 
+    mutate(year=lubridate::ymd(year, truncated=2)) %>%
+    rename(date=year) # remove last two quarters of incomplete year, treat these as part of hold-out set
+} else if (FREQUENCY == "quarter"){
+  data <- combined_data_quarter %>% rename(date=quarter)
+}
+
+```
+
+Next we compute some derived variables that might be useful in the analysis. Specifically, we normalize purchase and refinance originations by dividing them by GDP for each state. We also include purchase and refinance originations as a share of the total housing market in addition to the total housing market itself (which is their sum) and its GDP ratio.
+
+```{r derived_variables}
+
+if (FREQUENCY=="annual"){
+  data <- data %>%
+  group_by(Geography, date) %>%
+  mutate(
+    purch_orig_gdp = purch_orig / GDP,
+    refi_orig_gdp = refi_orig / GDP,
+    total_housing = purch_orig + refi_orig,
+    total_to_gdp = total_housing / GDP,
+    purch_orig_share = purch_orig / total_housing,
+    refi_orig_share = refi_orig / total_housing
+  ) %>% ungroup()
+} else if (FREQUENCY=="quarter"){
+    data <- data %>%
+      group_by(Geography, date) %>%
+      mutate(
+        purch_orig_gdp = purch_orig_ma / GDP,
+        refi_orig_gdp = refi_orig_ma / GDP,
+        total_housing = purch_orig + refi_orig,
+        total_to_gdp = total_housing / GDP,
+        purch_orig_share = purch_orig / total_housing,
+        refi_orig_share = refi_orig / total_housing
+      ) %>% ungroup()
+}
+
+
+# add a linear trend term for later use
+data <- data %>%
+  group_by(Geography) %>%
+  mutate(
+    TREND = seq(1, n(), by=1)
+  ) %>% ungroup()
+
+```
+
+
+Next we convert each variable to an index where the base is 100 and corresponds to the start of the data set for later use in the exploratory analysis. 
+
+```{r create_index, message=FALSE, warning=FALSE}
+make_index <- function(x){
+  (x / x[1])*100
+}
+
+rename_col <- function(x){paste0(x,"_index")}
+
+indices <- data %>%
+  group_by(Geography) %>%
+  mutate_at(setdiff(colnames(data), c("date","Geography")), make_index) %>%
+  rename_all(funs(rename_col)) %>%
+  ungroup()
+
+```
+
+
+
+# Exploratory Analysis
+
+## Cross-State Comparisons
+
+
+The plot below shows the home price index in its original value for each of the states in the data set. Each state had a large run-up in home prices starting in the early 2000's before the housing crash of 2007. California and Arizona had particularly pronounced peaks. Interestingly, home prices in those two states along with Colorado have undergone rapid increases after the trough in 2012 and continue to rise. 
+
+The home price index shows a steady upward trend for all states over time. However the slope of the trend for the three Western states previously mentioned appears to have changed and prices in those states are increasing faster than before the crash whereas the other states' long-term trends appear to be mostly unchanged.
+
+```{r cross_state_hpi, echo=FALSE}
+data %>%
+  ggplot() + 
+  geom_line(
+    mapping=aes(
+      x=date,
+      y=HPI,
+      color=Geography
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Date") + 
+  ggtitle("Cross-State Comparison of HPI") +  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+The next graph shows GDP for each state as an index with Q1 of 1990 as the base year. This allows a direct comparison of GDP between states across time on the same scale, which allows us to see which states had higher GDP growth. From the graph we can see that California and Colorado had the highest GDP growth. Arizona also has the 3rd highest, but is its trajectory is closer to that of the remaining states. These states also had large and pronouced bubbles and increased trends of home price appreciation post-crash. 
+
+```{r normalized_gdp, echo=FALSE}
+indices %>%
+  ggplot() +
+  geom_line(
+    mapping=aes(
+      x=date_index,
+      y=GDP_index,
+      color=Geography_index
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Date") + ylab("GDP (Index)") +
+  ggtitle("Cross-State Comparison of GDP", subtitle="Index, 1990Q1 = 100") +
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+The plot below shows the housing affordability index for each state in the set. One thing to note is that unlike the previous two series, the trends for each state follow roughly the same pattern, only the levels appear to be different. Unsurprisingly this series moves opposite the housing price index series since housing affordability is a decreasing function of price (among other things).
+
+```{r cross_state_hsng_affrdblty, echo=FALSE}
+data %>%
+  rename(Geography=Geography) %>%
+  ggplot() + 
+  geom_line(
+    mapping=aes(
+      x=date,
+      y=hsng_affrdblty,
+      color=Geography
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Date") + 
+  ggtitle("Cross-State Comparison of Housing Affordability Index") +  
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+The next plot shows the purchase-origins to GDP ratio. It can be seen that purchase originations as a share of the economy rose sharply in the years just before the housing crash then fell drastically after the crash as housing market activity collapsed as a fraction of the economy during the recession. Again, we see that the three Western states had the highest increases and are rebounding faster than the other states. 
+
+```{r cross_state_purch_to_gdp, echo=FALSE}
+data %>%
+  ggplot() +
+  geom_line(
+    mapping=aes(
+      x=date,
+      y=purch_orig_gdp,
+      color=Geography
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Year") + ylab("Ratio") + 
+  ggtitle("Cross-State Comparison of Purchase Originations to GDP Ratio") +
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+Below is the same graph but this time showing refinance originations as a share of GDP. This graph shows a different pattern, namely that refinance originations seem to follow a cyclical pattern that repeats every 4 to 5 years. (I don't know enough about the mortgage market to be able to say anything more about what might be causing this other than it might be informative to look at interest rates here).
+
+```{r cross_state_refi_to_gdp, echo=FALSE}
+data %>%
+  ggplot() +
+  geom_line(
+    mapping=aes(
+      x=date,
+      y=refi_orig_gdp,
+      color=Geography
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Year") + ylab("Ratio") + 
+  ggtitle("Cross-State Comparison of Refinance Originations to GDP Ratio") +
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+The graph below shows the share of purchase originations as a share of the mortgage market. The pattern appears to be driven by the cycles in refinance originations and unfortunatley does not appear to contain any more information not already contained in the previous graphs. However one thing is notworthy about the levels of the shares, namely that there was more refinancing happening before the housing crash than afterwards, which is perhaps an indication that there has been a change in home owner's expectations about long-term home price appreciation. However refinances are on the rise and are nearly back to pre-crash levels in some states, so maybe not. 
+```{r cross_state_purch_share, echo=FALSE}
+
+data %>%
+  ggplot() +
+  geom_line(
+    mapping=aes(
+      x=date,
+      y=purch_orig_share,
+      color=Geography
+    )
+  ) + scale_color_brewer(palette="Dark2") + xlab("Year") + ylab("Ratio") + 
+  ggtitle("Cross-State Comparison of Purchase Origination Share of Market") +
+  scale_x_date(date_labels="%Y", date_breaks="2 year") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+
+
+
+
+```
+
+## Bivariate Relationships
+
+Next we examine how some of the different variables relate to each other using scatter plots. 
+
+Below we plot the housing price index against the housing affordability index along with linear regression lines. Unsurprisingly, the two are negatively correlated for most states with some states such as California having a stronger negative correlations than others. Interestingly, some states slightly positive correlations. Since the housing affordability index captures other factors such as income in addition to home prices, it could be that those other factors are driving the positive correlations in those states. 
+
+```{r hpi_by_hsng_affrdblty, echo=FALSE}
+data %>%
+  ggplot(
+    mapping=aes(
+      x=hsng_affrdblty,
+      y=HPI,
+      color=Geography
+    )) + 
+  geom_point() + 
+  geom_smooth(
+    method="lm",
+    se=FALSE
+  ) +
+  scale_color_brewer(palette="Dark2") + xlab("Housing Affordability Index") + 
+  ggtitle("HPI vs Housing Affordability Index") 
+
+```
+
+The next graph plots the purchase originations to GDP ratio against the refinance to GDP ratio. In each state, there is a strong correlation between the two implying that as the refinances and new purchases increase together as the overall housing market grows as a share of GDP. 
+```{r purch_gdp_to_refi_gdp, echo=FALSE}
+
+data %>%
+  ggplot(
+    mapping=aes(
+      x=purch_orig_gdp,
+      y=refi_orig_gdp,
+      color=Geography
+    )) + 
+  geom_point() + 
+  geom_smooth(
+    method="lm",
+    se=FALSE
+  ) +
+  scale_color_brewer(palette="Dark2") + xlab("Refinance Origination to GDP Ratio") + ylab("Purchase Origination to GDP Ratio") + 
+  ggtitle("Purchase-to-GDP Ratio vs Refi-to-GDP Ratio") 
+
+
+```
+
+The following plot is included to demonstrate the problem of *spurious regression*. If one were to simply regress home prices on labor force participation, one would mistakenly conclude that a higher labor force participation rate leads to lower home values. This makes no sense economically and as we shall see in the time series graphs, labor force participation has been in secular decline for decades while home prices have been mostly rising. The two variables are simply trending in opposite directions and likely do not have a causal relationship. 
+
+```{r hpi_by_labor_force, echo=FALSE}
+data %>%
+  ggplot(
+    mapping=aes(
+      x=labor_part,
+      y=HPI,
+      color=Geography
+    )) + 
+  geom_point() + 
+  geom_smooth(
+    method="lm",
+    se=FALSE
+  ) +
+  scale_color_brewer(palette="Dark2") + xlab("Labor Force Participation Ratio") + ylab("HPI") + 
+  ggtitle("HPI and Labor Force Participation", subtitle="Example of a Spurious Relationship") 
+```
+
+## Within-State Series
+
+```{r include=FALSE}
+gdp_ratios <- c("purch_orig_gdp", "refi_orig_gdp", "total_to_gdp")
+derived_shares <-c("purch_orig_share", "refi_orig_share", "total_housing")
+```
+
+
+Next we show time series plots for each group of variables (the housing price index has been included in each group for comparison). There are five groups:
+
+1. Economic Variables: `r paste(econ_vars, sep=", ")`
+2. Housing Variables: `r paste(housing_vars, sep=", ")`
+3. Population Variables: `r paste(pop_vars, sep=", ")`
+4. GDP Ratios: `r paste(gdp_ratios, sep=", ")`
+5. Housing Market Shares: `r paste(derived_shares, sep=", ")`
+
+
+```{r}
+# select a state
+STATE <- "California"
+```
+
+(comments are for California for the sake of example and may not apply if a different state is chosen, but I've inspected these for all the states and most of the conclusions hold for all)
+
+```{r}
+if (FREQUENCY == "annual"){
+  freq <- 1
+  start <- 1990
+  end <- 2017
+} else if (FREQUENCY == "quarter"){
+  freq <- 4
+  start <- c(1990, 1)
+  end <- c(2018,2)
+}
+
+```
+
+#### Economic Variables
+
+The economic variables exhibit significant trending, which could potentially lead to a spurious correlation problem. In particular, *GDP* and *PCI* follow nearly identical trends. We also note that labor force participation declined while home prices increased over the period.
+
+```{r econ_vars, echo=FALSE}
+data %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, econ_vars)) %>%
+  ts(start=start, end=end, frequency=freq) %>%
+  autoplot(facet=TRUE) + ggtitle("Economic Variables", subtitle=eval(STATE))
+
+```
+
+#### Housing Variables
+
+The housing market variables all follow the same pattern. Interestingly, both *purch_orig* and *refi_orig* appears to lead *HPI*, both peaking and begining their decline before *HPI*. Unsurprisingly, housing affordability appears to be inversely related to *HPI*. 
+
+```{r housing_vars, echo=FALSE}
+data %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, housing_vars)) %>%
+  ts(start=start, end=end, frequency=freq) %>%
+  autoplot(facet=TRUE) + ggtitle("Housing Variables", subtitle=eval(STATE))
+
+```
+
+
+#### Population Variables
+
+The plot below shows that population variables may not be useful in predicting home prices. Intuitively one would that that migration should effect the demand-side of the housing market, however we see that during the run up in home prices before the 2007 housing crash, migration in California turned negative. Migration was positive over this period for other states, but since all of them saw an increase in home prices over that period but some have negative migration at the same time, this may indicate that some other mechanism is driving prices or the mechanism between migration and home prices is different in different states.
+
+```{r pop_vars, echo=FALSE}
+data %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, pop_vars)) %>%
+  ts(start=start, end=end, frequency=freq) %>%
+  autoplot(facet=TRUE) + ggtitle("Population Variables", subtitle=eval(STATE))
+
+
+```
+
+#### GDP Ratios
+
+The GDP ratios show similar patterns to the housing variables, which is not surprising since GDP follows a steady trend. However, the leading nature of the indicators appears more pronounced when seen as a share of GDP. 
+
+```{r gdp_ratios, echo=FALSE}
+data %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, gdp_ratios)) %>%
+  ts(start=start, end=end, frequency=freq) %>%
+  autoplot(facet=TRUE) + ggtitle("GDP Ratios", subtitle=eval(STATE))
+
+```
+
+#### Derived Shares
+
+Since refinances and originations sum to equal the entire mortgage market, their shares are mirror images of one another. More interesting is the *total_share*, which is the sum of *purch_orig* and *refi_orig*. This variable leads the home price index going into the peak of the housing bubble. 
+
+```{r derived_vars, echo=FALSE}
+data %>%
+  filter(Geography==eval(STATE)) %>%
+  dplyr::select(c(HPI, derived_shares)) %>%
+  ts(start=start, end=end, frequency=freq) %>%
+  autoplot(facet=TRUE) + ggtitle("Housing Market Shares", subtitle=eval(STATE))
+```
+
+
+
+## Trend and Collinearity Analysis
+
+
+### Trend Analysis
+
+Several of the variables in the data set appear to be trending. This can cause spurious relationships and invalidate some statistical procedures. We quantify how much each variable for each state is trending by looking at the $R^2$ values from regressing each variable on a simple linear trend: $y_t = \beta_0 + \beta_1t + e_t$. The results are shown below. The first graph shows the $R^2$ values and the second graph shows the slopes of the trends. The slopes of the trends have been normalized to be comparable across variables (the signs magnitudes are important, not the actual values).
+
+```{r trend_computation}
+# ignore date and geography columns
+variables_to_exclude <- c("refi_orig_share", "refi_orig_share_gdp", "purch_orig_share", "purch_orig_share_gdp")
+
+cols_to_ignore <- c("date", "Geography", "TREND", "refi_orig_share", "refi_orig_share_gdp", "purch_orig_share", "purch_orig_share_gdp")
+cols_to_check <- setdiff(colnames(data), cols_to_ignore)
+
+
+quantify_trend <- function(y){
+  # this function takes a vector and regresses it against a simple linear trend
+  # R-squared, MSE and slope coefficient for the regression are extracted
+
+  trend_term <- seq(1, length(y), by=1)
+  lm_fit <- lm(y ~ trend_term)
+  
+  # get R-squared and mean-squared error from the model
+  fit_summary <- summary(lm_fit)
+  fit_anova <- anova(lm_fit)
+  slope <- coefficients(lm_fit)[2]
+  
+  output <- c(fit_summary$r.squared, tail(fit_anova$`Mean Sq`, 1), slope)
+  
+  return(output)
+}
+
+
+# loop over all variables and all states and run 
+# the trend regressions and save their results
+results_df <- vector()
+for (state in unique(data$Geography)){
+  
+  for (col in cols_to_check){
+    
+    y <- data %>%
+      filter(Geography==eval(state)) %>%
+      pull(col)
+
+    results <- c(state, col, quantify_trend(y))
+    results_df <- c(results_df, results)
+    
+  }
+}
+
+# format results as matrix
+results_df <- matrix(results_df, ncol=5, byrow=TRUE)
+colnames(results_df) <- c("state", "variable", "rsquared", "mse", "slope")
+results_df <- as_tibble(results_df) %>%
+  mutate(
+    rsquared=round(as.double(rsquared),2),
+    mse=as.double(mse),
+    state=as.factor(state),
+    slope=round(as.double(slope),3)
+  )
+
+# standardize slopes for comparison between variables
+results_df <- results_df %>% 
+  group_by(variable) %>%
+  mutate(
+    slope = round(scale(slope, center=FALSE), 3)  # divide by standard deviation, do not center to preserve signs
+  ) %>%
+  ungroup()
+```
+
+Based on these two charts, we can make several observations: 
+
+* *total_pop*, *PCI*, *labor_part*, *GDP* and *HPI* all have strong trends. In these variables, the trend explains a high proportion of the variation, often over 90%. This is unsurprising for variables like GDP, total population and income per capita since these tend to grow over time
+* home prices have been increasing overall
+* housing affordability shows strong positive trends in some states (Alabama, Arkansas, Connecticut) but not others
+* labor force participation has been declining in each state over time
+* the overall trend for migration in each state in the data set has been slightly down
+* California has more pronounced trends than the rest of the states
+
+
+```{r trend_r_squared, echo=FALSE}
+results_df %>%
+  rename(`R Squared`=rsquared) %>%
+  ggplot(
+    mapping=aes(
+      x=state,
+      y=variable
+    )
+  ) + 
+  geom_tile(mapping=aes(fill=`R Squared`), color="white") + 
+  geom_text(aes(label=`R Squared`)) + 
+  scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("State") + ylab("Variable") + ggtitle("Trend R-Squared Values") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+```
+
+
+
+```{r trend_direction, echo=FALSE}
+results_df %>%
+  rename(`Slope (Scaled)`=slope) %>%
+  ggplot(
+    mapping=aes(
+      x=state,
+      y=variable
+    )
+  ) + 
+  geom_tile(mapping=aes(fill=`Slope (Scaled)`), color="white") + 
+  geom_text(aes(label=`Slope (Scaled)`)) + 
+  scale_fill_gradient2(low="red", mid="white", high="steelblue", midpoint=0) + 
+  xlab("State") + ylab("Variable") + ggtitle("Trend Slopes", subtitle="Scaled For Comparison Between Variables") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+### Collinearity Analysis
+
+Next we turn to the problem of collinearity. Collinearity can be a problem since it makes the variances of the estimated coefficients larger and can result wide confidence intervals, insignificant p-values and large changes coefficient magnitudes and signs with the inclusion/exclusion of other variables [1,3].
+
+#### Variance Inflation Factors
+
+First we look at the variance inflation factors of the coefficients from the regression of *HPI* on the original, non-derived variables (including the linear trend). 
+
+Interpreting the magnitude of the VIFs is somewhat subjective, but we use the rule of thumb that a VIF of 10 is a problem since that would correspond to an R-squared of 0.9, meaning that 90% of the variation in the variable is explained by the others.
+
+The results are shown below for each variable (the trend term is excluded). We can see that according to the VIFs, collinearity is a serious problem for *total_pop*, *GDP* and *PCI*. From the time series plots of these variables and the R-squared values of the trend regressions, the high VIFs are likely due to all of these variables trending together and are likely mutually responsible for the collinearity of the others. 
+
+```{r}
+
+cols_to_ignore <- c("date", "Geography", "HPI", gdp_ratios, derived_shares)
+cols_to_use <- setdiff(colnames(data), cols_to_ignore)
+
+f <- as.formula(paste0("HPI ~", paste(cols_to_use, collapse="+")))
+
+# loop over states and compute VIFs for the regression above
+vif_results <- tibble()
+for (state in unique(data$Geography)){
+  
+  data_subset <- data %>%
+    filter(Geography==eval(state))
+  
+  base_model <- lm(f, data=data_subset)
+  vifs <- round(car::vif(base_model))
+  vars <- names(vifs)
+  
+  temp <- tibble(state, vars, vifs)
+  vif_results <- bind_rows(vif_results, temp)
+}
+
+```
+
+```{r vif_plot, echo=FALSE}
+vif_results %>%
+  filter(vars != "TREND") %>%
+  rename(
+    VIF=vifs,
+  ) %>%
+  ggplot(
+    mapping=aes(
+      x=state,
+      y=vars
+    )
+  ) + 
+  geom_tile(mapping=aes(fill=VIF), color="white") + 
+  geom_text(aes(label=VIF)) + 
+  scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("State") + ylab("VIF") + ggtitle("Variance Inflation Factors") + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+```
+
+
+#### Variance-Decomposition Method
+
+The variance inflation factors do not tell us which other variables are involved in a collinear relationship. In order to deal with this, we apply the variance-decomposition method as found in [3]. (The details of this method are found in the appendix.)
+
+At a high-level, the method decomposes the variance of each regression coefficient $var(\beta_k)$ into a sum of terms involving the singular values of the data matrix $X$. Terms that are associated with both a high *condition index* (see appendix) and a high proportion of the variance are associated with collinearity. Specifically, if a high condition index is associated with high variance proportions for *two or more variables*, this indicates these variables are involved in a collinear relationship. There are more subtleties to interpreting the variance proportions that are detailed in the appendix. 
+
+Note that since we have included the trend term (which isn't shown in the table below but is still being used in the computations) the collinear relationships found by the method account for the trend of the variables involved. 
+
+
+```{r variance_decomposition_algo}
+variance_proportion_table <- function(x){
+  
+  svd_decomp <- svd(x)
+  
+  mu <- svd_decomp$d                # singular values
+  condition_index <- max(mu) / mu   # condition index
+  
+  # create variance proportion matrix
+  
+  # broadcast singular values across rows
+  Mu <- matrix(rep(mu, length(mu)), byrow=TRUE, nrow=length(mu))     
+  # create decomp ratios (see appendix)
+  phi <- (svd_decomp$v^2 / Mu^2)             
+  # get their sums (for computing proportions)
+  phi_sum <- apply(phi, 1, sum)         
+  # broadcast sums (the denominator) across columns
+  phi_sum <- matrix(rep(phi_sum, length(phi_sum)), byrow=FALSE, nrow=length(phi_sum))  
+  # divide to get proportions
+  variance_proportion <- phi / phi_sum                                                
+  
+  if (!is.null(colnames(x))){
+    row.names(variance_proportion) <- colnames(x)
+  }
+  
+  colnames(variance_proportion) <- as.character(round(condition_index,4))
+  
+  output <- list(
+    condition_index=condition_index,
+    variance_proportions=variance_proportion
+  )
+  
+  return(output)
+}
+
+```
+
+
+
+#### Variance-Decomposition Results
+
+The results for California are shown below and demonstrate the method. The results are sorted by condition index from smallest on the left to largest on the right. From the plot we can see that the largest condition index is associated with the trend term and with *total_pop*. This is unsurprising since *total_pop* was nearly entirely explained by the trend in the previous trend analysis. The next largest condition index is associated with *PCI* and *GDP*, indicating they are collinear. This confirms what can easily be seen in the trend plots - economically speaking, both of these can been seen as proxies for overall economic growth. The remaining variables have variance proportions scattered across the condition indices and none appear together with a variance proportion over 50%, so we conclude that while some of these are involved in weak collinear relationships, we cannot tell for certain which variables are involved. 
+
+```{r compute_variance_decomps}
+cols_to_ignore <- c("date", "Geography", "HPI", gdp_ratios, derived_shares)
+cols_to_use <- setdiff(colnames(data), cols_to_ignore)
+
+
+# [3] recommend standarizing all columns to have unit length
+X_scaled <- data %>% 
+ filter(Geography=="California") %>%
+ dplyr::select(cols_to_use) %>%
+ mutate_all(function(x) {x / sqrt(sum(x^2))}) %>%
+ as.matrix()
+
+# append a column of ones for the intercept term
+X_scaled <- cbind(rep(1, nrow(X_scaled)), X_scaled) 
+
+variance_decomp <- variance_proportion_table(X_scaled)
+```
+
+```{r variance_decomp_plotting, echo=FALSE}
+variance_proportion <- variance_decomp$variance_proportions[-1,] %>% 
+  t() %>%
+  as_tibble() %>% 
+  round(2)
+
+condition_index <- tibble::enframe(
+  round(variance_decomp$condition_index,2), 
+  name=NULL, 
+  value="condition_index")
+
+combined <- dplyr::bind_cols(condition_index, variance_proportion)
+
+reshape2::melt(combined, id.vars="condition_index") %>%
+  rename(Proportion=value) %>%
+ggplot(mapping=aes(x=as.factor(condition_index), y=variable)) + 
+geom_tile(
+  mapping=aes(
+    fill=Proportion
+  ),
+  color="white"
+) + geom_text(aes(label=Proportion)) + 
+    scale_fill_gradient(low="white", high="steelblue") + 
+  xlab("Condition Index") + ylab("Indicator") + ggtitle("Variance Proportion Table", subtitle=STATE) + 
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+
+# Variable Selection
+
+Based on the preceding analysis we decided to select variables based on economic grounds.
+
+I decided to discard *labor_part* because the steady negative trend in each state will result in a spurious relationship if included in any model. Labor force participation has been declining in the United States for decades and if anything, one would expect declining participation in the labor force to lead to lower demand for new housing since fewer people are working, however home prices have been trending upward over the same period so something else must be going on. 
+
+*migration_qtr* was discarded because it often moved in the opposite direction one would expect. If move people are moving to a state, one would expect home prices to rise because of increased demand relative to the supply of homes and vice-versa. However, in some states such as California, home prices experienced a sharp increase while the state lost population. However, it would be interesting to explore this relationship further since if a state is gaining population faster than its housing stock is increasing, home prices should rise. 
+
+*total_pop* and *PCI* were also excluded because of the strong long-term trends and collinearity. Populations and incomes grow over time and this phenomenon is also captured by *GDP* growth, which we also exclude because it is already included in the GDP-ratio variables, which we do use. However we note that *GDP* or its change could be used as a control variable. This was tried and it resulted in worse forecast accuracy than simply including a deterministic trend. 
+
+*hsng_affrdblty* was also excluded because the models that were tried did better without it. 
+
+The remaining variables were omitted due to time constraints.
+
+# Forecasting
+
+Next we try forecasting. There are several approaches we could take, but we decided that it would easiest to forecast the *level* of HPI and then compute percent changes using the forecasted levels. We could just as well have modeled changes directly (often this makes more sense in a time series context). we also rebase HPI to start at 100 at the beginning of the series which will allow for direct comparisons of estimated coefficients between states. 
+
+We also decided to use "traditional" forecasting methods instead of machine learning. Specifically, we use linear models of various kinds. Since it was seen in the exploratory analysis that different variables behaved differently between states, we use separate models for each state instead of a single model with indicator and indicator-interaction variables. Specifically for the sake of demonstration, we use California as the example in what follows. 
+
+The evaluation metric we use for evaluating the forecasted percent changes is the mean absolute error. The reason this metric was chosen is because it is in the same units as the quantity being forecasted. In this case, the MAE has the interpretation of being the average *percentage-point* deviation from the actual year-over-year percent change. 
+
+Both the MAE of the year-over-year change and the level MAE are reported in the results below. 
+
+```{r}
+STATE = "California"
+#cols_to_exclude <- c("quarter", "GDP", "total_pop", "migration_qtr", "Geography")
+
+# rebase index to 100 and compute y-o-y percent change
+data_subset <- data %>% 
+  filter(Geography==eval(STATE)) %>%
+  mutate(
+    HPI_change = HPI / lag(HPI),
+    HPI = HPI / HPI[1] * 100,
+  )
+
+data_ts <- data_subset %>%
+  ts(start=start, end=end, frequency=freq)
+
+# create training/test split for annual and quarterly data
+if (FREQUENCY == "annual"){
+  train_ts <- window(data_ts, end=2012)
+  test_ts <- window(data_ts, start=2013)
+} else if (FREQUENCY == "quarter") {
+  train_ts <- window(data_ts, end=c(2011, 4))
+  test_ts <- window(data_ts, start=c(2012,1))
+}
+
+
+MAE <- function(y, y_hat){
+  mean(abs(y - y_hat))
+}
+
+# compute MAE for a forecasted model
+compute_eval <- function(forecast_object, train, test){
+  
+  # get the last observation from the training set
+  # (needed for computing the percent change for the first time step in the forecast)
+  train_last <- as.vector(tail(train[, "HPI"], 1))
+  
+  # append to the forecast
+  forecast_series <- c(train_last, forecast_object$mean)
+  
+  # take the percent change by dividing each value by the previous one
+  forecast_pct_change <- forecast_series / lag(forecast_series)
+  forecast_pct_change <- forecast_pct_change[2:length(forecast_pct_change)]
+  
+  # compute the mean percentage-point deviation
+  deviation <- MAE(forecast_pct_change, as.vector(test[, "HPI_change"]))
+  
+  output <- list(
+    mean_deviation=deviation,
+    forecast=ts(forecast_pct_change, frequency=frequency(test), end=end(test), start=start(test)),
+    actual=test[, "HPI_change"]
+  )
+  return(output)
+}
+
+# print the output of the compute_eval() function
+print_summary <- function(output){
+  
+  message <- glue::glue("The MAE is {score}.", score=round(output$mean_deviation, 3))
+
+  print(message)
+  print("Forecasted Changes: ")
+  print(as.vector(output$forecast))
+  print("Actual Changes: ")
+  print(as.vector(output$actual))
+}
+```
+
+## Establishing a Baseline
+
+Before building a statistical or machine learning model, it is important to establish a simple "strawman" model as a baseline for comparison to any more advanced methods. We do this by first developing a simple forecasting model using only *HPI* without the use of the exogenous variables. From plots of HPI, it appears as though there is a strong trend over time and we can safely conflude the series is non-stationary (at least in the levels). 
+
+We therefore decide to make a random walk with drift our "strawman" model against which we will compare other models. This forecast for a random-walk model is equivalent to drawing a straight line between the first and last points in the training set and extrapolating them into the future [2]. The results are shown below and we see that random-walk forecast is not very good. Hopefully we can beat it with more sophisticated models. 
+
+
+
+```{r echo=FALSE}
+rwf_model <- forecast::rwf(train_ts[,"HPI"], h=nrow(test_ts), drift=TRUE)
+
+autoplot(rwf_model) +
+  autolayer(test_ts[,"HPI"], series="Actual") + 
+  xlab("Year") + ylab("HPI") + ggtitle("Random Walk with Drift Forecast", subtitle=eval(STATE))
+
+print("----- Level Accuracy ------")
+forecast::accuracy(rwf_model, test_ts[, "HPI"])
+print("----- Percent Change Accuracy -----")
+print_summary(compute_eval(rwf_model, train_ts, test_ts))
+```
+
+## Bringing In Exogenous Variables
+
+### Linear Regression with a Deterministic Time Trend
+
+For our first pass at including exogenous variables we take the same approach as before and start with a simple model first. In this case, we simply fit a linear regression model with a deterministic time trend:
+
+$$
+HPI_t = \beta_0 + \beta_1 \text{purch_orig_gdp}_t + \beta_2 \text{refi_orig_gdp}_t + \beta_3 t + e_t
+$$
+
+
+Next we use the model to forecast over the period of the test set. The plot of the forecast and prediction intervals is shown below along with computed accuracy metrics. We can see that the linear model is a significant improvement over the random-walk model. 
+
+The estimated coefficients are shown below. (We do not include the full model output because the usual test statistics and standard errors will be invalidated in the presense of autocorrelation [1]). 
+
+
+```{r}
+linear_model <- tslm(HPI ~ purch_orig_gdp + refi_orig_gdp + trend , data=train_ts)
+coefficients(linear_model)
+```
+
+
+```{r echo=FALSE}
+
+fcast_linear <- forecast(linear_model, newdata=as.data.frame(test_ts))
+
+autoplot(fcast_linear) + xlab("Year") + ylab("HPI") + ggtitle("Linear Model Forecast", subtitle=eval(STATE)) + 
+  autolayer(test_ts[,"HPI"], series="Actual")
+
+print("----- Level Accuracy ------")
+accuracy(fcast_linear, x=as.data.frame(test_ts))
+print("----- Percent Change Accuracy -----")
+print_summary(compute_eval(fcast_linear, train_ts, test_ts))
+```
+
+Next we inspect the residuals for autocorrelation. Both the Ljung-Box for residual autocorrelation and the ACF plot confirm the presense of autocorrelation, implying that we are leaving information unaccounted for in the model and suggests an improvement could be achieved by including a dynamic (i.e. lagged) component.  
+
+```{r echo=FALSE}
+checkresiduals(linear_model, test="LB")
+```
+
+### Adding a Dynamic Component: Linear Regression with ARIMA Errors
+
+We next look at the partial autocorrelation plot of *HPI*. Given a set of variables, the partial correlation between two of them is the conditional correlation after the partial effects of the other variables have been removed. In the time-series context, the $PACF(y_t, y_{t-h})$ is the correlation between $y_t$ and $y_{t-h}$ once the linear effects of the other lags $\ell \neq h$ have on $y_t$ been accounted for [4]. 
+
+The interpretation of the graph below that there is no significant correlation between $y_t$ and $y_{t-h}$ for $h > 2$. We also do the same for the residuals of the linear model and see the same pattern in the error structure. 
+
+```{r echo=FALSE}
+ggPacf(data_ts[, "HPI"]) + ggtitle("PACF for HPI", subtitle=STATE)
+
+```
+
+```{r echo=FALSE}
+ggPacf(residuals(linear_model)) + ggtitle("PACF for Residuals of the Linear Model", subtitle=STATE)
+
+```
+
+
+
+This suggests that we include autoregressive terms in the error structure: 
+$$
+HPI_t = \beta_0 + \beta_1 \text{purch_orig_gdp}_t + \beta_2 \text{refi_orig_gdp}_t + \beta_3 t + \nu_t
+$$
+
+with ARMA errors: $\nu_t = \phi_1 \nu_{t-1} + \phi_2 \nu_{t-2} + e_t + \delta_1 e_{t-1} + \delta_2 e_{t-2}$
+
+Note that the autoregressive structure indicates the potential presense of a dynamic process that is unaccounted for by contemporaneous regressors and could imply we should try lagged values of the exogenous variables or include more/different variables in the model.
+
+The results are shown below and we can see that the inclusion of the autoregressive terms have increased the accuracy of the model over the simple linear model. 
+
+```{r arima_model}
+variables_to_include <- c("purch_orig_gdp", "refi_orig_gdp")
+X_train <- train_ts[, variables_to_include]
+X_test <- test_ts[, variables_to_include]
+
+arima_model <- Arima(y=train_ts[, "HPI"], xreg=X_train, order=c(2,0,2), include.drift = TRUE, transform.pars=FALSE)
+
+summary(arima_model)
+
+```
+
+```{r}
+data_train <- as.data.frame(train_ts)
+data_test <- as.data.frame(test_ts)
+```
+
+
+
+```{r arima_forecast, echo=FALSE}
+fcast_arima <- forecast(arima_model, xreg=X_test)
+
+autoplot(fcast_arima) + xlab("Year") + ylab("HPI") + ggtitle("Linear Regression with ARIMA(2,0,2) Errors", subtitle=eval(STATE)) + 
+  autolayer(test_ts[,"HPI"], series="Actual")
+
+print("----- Level Accuracy ------")
+accuracy(fcast_arima, x=test_ts[, "HPI"])
+print("----- Percent Change Accuracy -----")
+print_summary(compute_eval(fcast_arima, train_ts, test_ts))
+
+```
+
+The residual diagnostics for the ARIMA model are shown below. We can see that autocorrelation, while still an issue at the 10% significance level, has been significantly mitigated. 
+
+```{r echo=FALSE}
+checkresiduals(arima_model, test="LB")
+```
+
+### Another Pass: An Autoregressive Distributed Lag Model (ARDL)
+
+The previous partial autocorrelation plot for $HPI$ showed that there was autocorrelation up to the second lag. To encorporate this explicitly into the model, we use an ARDL model of the form:
+
+$$
+HPI_t = \beta_0 + \phi_1 HPI_{t-1} + \phi_2 HPI_{t-2} + \beta_1 \text{purch_orig_gdp}_t + \beta_2 \text{refi_orig_gdp}_t + \beta_3 t + e_t
+$$
+
+Predictions with ARDL models is tricky since predicted values of the dependent variable need to be feedback into the lagged terms as you forecast more steps into the future. Unfortunately none of the packages support prediction for ARDL models out of the box. While it is possible to write your own, the package that I decided to use allows for simulations for exogenous shocks to the independent variables to see how they propogate across time. I thought it might be more interesting to try and understand the dynamics of the models before going to the trouble of writing a prediction function for them. 
+
+```{r message=FALSE, include=FALSE}
+
+shockval<-0.2
+time <- 6
+
+dyn_model <- dynardl(HPI ~ purch_orig_gdp + refi_orig_gdp, 
+        data=data_train, 
+        levels=c("purch_orig_gdp", "refi_orig_gdp"),
+        lags=list("HPI"=c(1,2)),
+        ec=FALSE,
+        trend=TRUE,
+        constant=TRUE,
+        simulate=TRUE,
+        shockvar="purch_orig_gdp",
+        shockval=shockval,
+        time=time,
+        burnin=time - 1)
+```
+
+
+
+```{r dynarld_summary, include=FALSE}
+summary(dyn_model)
+```
+
+Continuing with the analysis, we check the residuals of the model for autocorrelation. From visual inspection and the results of the Breusch-Godfrey test, we conclude there is autocorrelation in the residuals. Since we are not able to account for this explcitly in an ARDL model by encorporating an autoregressive structures in the error terms, these tests indicate that including the lagged values of the predictors was not enough to eliminate the autocorrelation from the original linear model. 
+
+```{r echo=FALSE}
+checkresiduals(dyn_model$model, test="LB")
+```
+
+Next we investigate the model's dynamics using simulations. Specifically, we apply a "exogenous shock" to the *purch_orig_gdp* variable by causing the purchase originations-to-GDP ratio to increase by 20% of GDP in a single time period and see how the shock effects the path of HPI. The results are shown below both in terms of the level of HPI (first plot) and the change in HPI attributed to the shock (second plot). 
+
+From both plots we can see that the shock causes an increase in HPI that lasts for several periods before returning to its long-run trend. This is consistent with a housing price bubble. 
+
+However, there are problems with this model. The first is that home prices never actually *fall*, only the rate of increase falls. The other problem is that the shock likely lasts too long. We can see from the shock effect decay plot (second plot) that it takes about ten years for the effect of the increase to die off. While I am not an expert in the housing market, this seems to be too long of a time for effects of a rapid increase in home prices to readjust to their long-run equalibrium. 
+
+```{r echo=FALSE, message=FALSE}
+p <- dynardl.simulation.plot(dyn_model, 
+                             type="area", 
+                             response="levels", 
+                             xlab="Time", ylab="HPI (level)")
+p + abline(v=time-1)
+p + title(main=glue::glue("Simulation Results for Exogenous Shock to {var}", var="purch_orig_gdp"),
+          sub=glue::glue("Shock of {val} at t={time}, response levels", val=shockval, time=time-1)
+          )
+
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+p <- dynardl.simulation.plot(dyn_model, 
+                             type="area", 
+                             response="shock.effect.decay", 
+                             xlab="Time", ylab="Change in HPI Due to Shock")
+p + abline(v=time-1)
+p + title(main=glue::glue("Simulation Results for Exogenous Shock to {var}", var="purch_orig_gdp"),
+          sub=glue::glue("Shock of {val} at t={time}, |change in response value|", val=shockval, time=time-1)
+          )
+
+```
+
+
+### Other Possible Avenues
+
+* trying lagged values of the exogenous variables
+* using differences in the dependent and independent variables instead of levels
+* structural time-series models
+* non-traditional / machine learning techniques
+* testing for cointegration (learned about this too late in the project to include here)
+
+
+
+### Forecasting 2018 - 2020
+
+Use the model developed above to forecast the level and percent change in HPI for the three years 2018 through 2020. We use the linear model with ARIMA errors for forecasting.
+
+```{r message=FALSE}
+
+# get, format and subset the data needed for the forecasts
+full_data <- read_csv("~/data/combined_data_quarter.csv") %>%
+  filter(Geography != "District Of Columbia") %>%
+  mutate(
+    Geography=as.factor(Geography),
+    year=lubridate::ymd(year, truncated=2)
+  ) %>% rename(date=year) %>%
+  dplyr::select(Geography, date, GDP, HPI, purch_orig, refi_orig) %>%
+  group_by(Geography, date) %>%
+  summarise(
+    HPI = mean(HPI),
+    GDP = mean(GDP),
+    purch_orig=sum(purch_orig), 
+    refi_orig=sum(refi_orig)
+  ) %>%
+  mutate(
+    purch_orig_gdp = purch_orig / GDP,
+    refi_orig_gdp = refi_orig / GDP
+  ) %>% dplyr::select(Geography, date, HPI, purch_orig_gdp, refi_orig_gdp) %>% 
+  ungroup()
+  
+```
+
+```{r message=FALSE}
+
+# initialize empty dataframe
+results <- tibble()
+
+# loop over states and compute the forecasts
+for (state in unique(full_data$Geography)){
+  
+  state_subset <- full_data %>%
+    filter(Geography==eval(state))
+  
+  training_set <- state_subset %>%
+    filter(date < "2018-01-01") %>%
+    dplyr::select(HPI, purch_orig_gdp, refi_orig_gdp) %>%
+    ts(start=1990, end=2017, frequency=1)
+  
+  # get last value for percent change computation
+  most_recent_value <-as.vector(tail(training_set,1)[, "HPI"])
+  
+  forecast_set <- state_subset %>%
+    filter(date >= "2018-01-01") %>%
+    dplyr::select(HPI, purch_orig_gdp, refi_orig_gdp) %>%
+    ts(start=2018, end=2020, frequency=1) 
+  
+  
+  model <- Arima(
+    y=training_set[, "HPI"], 
+    xreg=training_set[, c("purch_orig_gdp", "refi_orig_gdp")], 
+    order=c(2,0,2), 
+    include.drift = TRUE)
+  
+  forecasted_levels <- forecast(model, xreg=forecast_set[, c("purch_orig_gdp", "refi_orig_gdp")])
+  forecasted_levels_augmented <- c(most_recent_value, as.vector(forecasted_levels$mean))
+  
+  forecast_pct_change <- forecasted_levels_augmented / lag(forecasted_levels_augmented)
+  forecast_pct_change <- forecast_pct_change[2:length(forecast_pct_change)]
+  
+  results <- tibble(
+    state=rep(state,3),
+    year=c(2018,2019,2020),
+    HPI=as.vector(forecasted_levels$mean),
+    HPI_change=forecast_pct_change
+  ) %>% bind_rows(results)
+  
+}
+
+write_csv(results, "~/data/forecasts.csv")
+
+```
+
+
+
+
+# Appendix
+
+## Variance Inflation Factors
+
+The variance inflation factor of the $k$th coefficient of a linear regression model is defined as 
+$$
+VIF_k = \frac{1}{1-R_k^2}
+$$
+where $R_k^2$ is the R-squared value from regressing $x_k$ on all the remaining variables. $R_k^2$ is the fraction of the variation in $x_k$ explained by the other variables. A high $VIF_k$ indicates that $R_k^2$ is near 1 and is an overall indication that $x_k$ is collinear with some of the other variables [1].
+
+## Variance-Decomposition Method
+
+The variance-decomposition method relies on the fact that matrices that are near-singular (and have near-linear relationships among the columns) tend to have "small" singular values and that the variance of the regression coefficients can be decomposed into a sum of terms involving these values. 
+
+
+Specifically, the condition number of a matrix $\mathbf{X}$ is defined as the ratio between the smallest and largest singular values:
+
+$$
+\kappa(\mathbf{X}) = \frac{\mu_{max}}{\mu_{min}}
+$$
+A large condition number indicates the matrix is near-singluar. [3] extend this concept to define a *condition index* which is the ratio of each singular value with the the largest:
+
+$$
+\nu_k = \frac{\mu_{max}}{\mu_k}
+$$
+
+The presense of large condition indices can help us identify collinearity in conjuction with the decomposition, which we detail next. 
+
+The covariance of the regression $\mathbf{y} = \mathbf{X}\mathbf{\beta} + \mathbf{e}$ is $\sigma^2 (\mathbf{X}^T\mathbf{X})^{-1}$ whose diagonal elements are the variances of the regression coefficients, $\beta_k$. Using the singular value decomposition of $\mathbf{X}=\mathbf{U}\mathbf{D}\mathbf{V}^T$, the variance can be expressed as 
+
+$$
+\sigma^2 (\mathbf{X}^T\mathbf{X})^{-1} = \sigma^2VD^{-2}V^T
+$$
+
+where the $k$th diagonal entry is
+$$
+var(\beta_k) = \sigma^2 \sum_{j} \frac{v_{kj}^2}{\mu_j^2}
+$$
+which shows that the variance can be decomposed into a sum involving the singular values of $\mathbf{X}$. ($\mathbf{X}$ must be scaled so the columns have unit length before applying SVD). Very small singular values will increase the ratio term and contribute more to the variance, all else being equal. 
+
+Next they define the *variance-decomposition proportion* by simply converting the terms in the sum into proportions that sum to 1. The result is a table whose entries $\pi_{kj}$ is the proportion of $var(\beta_k)$ associated with the $j$th term in the decomposition sum (involving the $j$th singular value). The entries of this table can be used in conjunction with the condition indices to identify collinear relationships. 
+
+The diagnostic procedure has two parts: 
+
+1. a singular value with a high condition index which is associated with
+2. high variance-decomposition proportions for *two or more* variables
+
+The proceedure involves choosing cut-offs for both the proportion and the condition index. Empirical experiments in [1] showed that strong collinearity began to manifest as condition indices went over 30. They also use 50% as their cutoff for the variance proportions. The number of condition indices above the cutoff is taken as the number of near-dependencies in the columns of $X$. 
+
+There are three cases for determining the kind of dependency a variable is involved in:
+
+* a single linear dependency: a variable has a high variance-decomposition proportion associated with a high condition index along with at least one other variable
+* competing dependencies: when there are multiple high condition indices of similar magnitude, it is possible to tell by summing the variance-proprtions across the variables which variables are involved in the dependencies, but not which dependencies they are involved in
+* dominating dependencies: if there are two high condition indices such that $\mu_1 << \mu_2$, and a variable has a high variance-decomposition proportion associated with $\mu_2$, we cannot rule out its involvement with the variables associated with $\mu_1$ because the dependency identified in $\mu_2$ is so strong that it masks the weaker one 
+
+
+
+
+
+
+# References
+
+1. Wooldridge, Jeffrey. (2003). *Introductory Econometrics: A Modern Approach*. Tompson South-Western
+2. Hyndman, R. J., & Athanasopoulos, G. (2018). *Forecasting: Principles and Practice*. (2nd ed.) OTexts. https://otexts.org/fpp2/
+3. Belsley, David A., Edwin Kuh, and Roy E. Welsch. *Regression diagnostics: Identifying influential data and sources of collinearity*. Vol. 571. John Wiley & Sons, 1974.
+4. Parker, Jeffrey. Economics 312 Lecture Notes, Reed College. https://www.reed.edu/economics/parker/312/
+
+
+
+
+
+
+
+
