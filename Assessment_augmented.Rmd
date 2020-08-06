@@ -14,7 +14,8 @@ library(urca)
 library(glue)
 library(tsutils)
 library(dynlm)
-library(dynamac)
+#library(dynamac)
+devtools::install_github("https://github.com/andyphilips/dynamac.git")
 
 combined_data_quarter <- read_csv("~/data/combined_data_quarter.csv") %>%
   filter(Geography != "District Of Columbia") %>%
@@ -1108,6 +1109,7 @@ dyn_model <- dynardl(HPI ~ purch_orig_gdp + refi_orig_gdp,
         shockvar="purch_orig_gdp",
         shockval=shockval,
         time=time,
+        noLDV=FALSE,
         burnin=time - 1)
 ```
 
